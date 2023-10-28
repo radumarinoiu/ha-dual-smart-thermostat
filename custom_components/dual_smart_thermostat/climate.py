@@ -1,7 +1,8 @@
 """Adds support for dual smart thermostat units."""
 
 import asyncio
-from datetime import timedelta
+import math
+from datetime import timedelta, datetime
 import logging
 
 import voluptuous as vol
@@ -20,6 +21,7 @@ from homeassistant.components.climate.const import (
     SUPPORT_TARGET_TEMPERATURE,
     SUPPORT_TARGET_TEMPERATURE_RANGE,
 )
+from homeassistant.components.recorder import get_instance, history
 from homeassistant.const import (
     ATTR_ENTITY_ID,
     ATTR_SUPPORTED_FEATURES,
@@ -48,6 +50,7 @@ from homeassistant.helpers.reload import async_setup_reload_service
 from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.typing import ConfigType
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.util import dt as dt_util
 
 from custom_components.dual_smart_thermostat.opening_manager import OpeningManager
 
@@ -323,6 +326,9 @@ class DualSmartThermostat(ClimateEntity, RestoreEntity):
             self._hvac_mode = None
         self._active = False
         self._cur_temp = None
+        self._predict_hours = 1
+        self._predict_trend_tangential_function = lambda x: (1 - 1 / (x**2 + 1)) / 2
+        self._predicted_temp = None
         self._cur_floor_temp = None
         self._temp_lock = asyncio.Lock()
         self._min_temp = min_temp
@@ -540,6 +546,12 @@ class DualSmartThermostat(ClimateEntity, RestoreEntity):
         return self._cur_temp
 
     @property
+    def predicted_temperature(self):
+        if self._predicted_temp is not None:
+            return self._predicted_temp
+        return self._cur_temp
+
+    @property
     def current_floor_temperature(self):
         """Return the sensor temperature."""
         return self._cur_floor_temp
@@ -709,6 +721,7 @@ class DualSmartThermostat(ClimateEntity, RestoreEntity):
             return
 
         self._async_update_temp(new_state)
+        await self._async_update_predicted_temperature(new_state)
         await self._async_control_climate()
         self.async_write_ha_state()
 
@@ -799,6 +812,61 @@ class DualSmartThermostat(ClimateEntity, RestoreEntity):
         if new_state is None:
             return
         self.async_write_ha_state()
+
+    async def _async_update_predicted_temperature(self, state):
+        if state is None or state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+            return
+
+        try:
+            end = datetime.now()
+            start = end - timedelta(hours=4)
+            start, end = dt_util.as_utc(start), dt_util.as_utc(end)
+            _sensor_temperature_histories = await get_instance(self.hass).async_add_executor_job(
+                history.state_changes_during_period,
+                self.hass,
+                start,
+                end,
+                self.sensor_entity_id,
+            )
+            _valid_states = [
+                elem
+                for elem in _sensor_temperature_histories.get(self.sensor_entity_id, list())
+                if elem.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN)
+            ]
+            if _valid_states and len(_valid_states) > 8:
+                _values = [float(elem.state) for elem in _valid_states]
+                _timestamps = [elem.last_changed for elem in _valid_states]
+                _trend_values_normalized = [
+                    (_values[index + 1] - _values[index]) /  # Value difference between every 2 values
+                    ((_timestamps[index + 1] - _timestamps[index]).total_seconds()/60)
+                    # Time difference between every 2 values
+                    for index in range(len(_valid_states) - 1)
+                ]  # Those temperature deltas are interval-normalized, so the "delta" is actually "per minute"
+                _trend_values_count = len(_trend_values_normalized)
+                _trend_recent_values_count = math.ceil(_trend_values_count/4)
+                _trend_recent_values_normalized = _trend_values_normalized[-_trend_recent_values_count:]
+
+                # Calculate 2 line moving average (one whole dataset, the other most recent 25% of the dataset)
+                _whole_dataset_trend = sum(_trend_values_normalized) / _trend_values_count
+                _most_recent_trend = sum(_trend_recent_values_normalized) / _trend_recent_values_count
+                _final_trend = _whole_dataset_trend
+                message = f"[{self.sensor_entity_id}] "
+                if _whole_dataset_trend * _most_recent_trend < 0:
+                    _final_trend = _most_recent_trend
+                else:
+                    message += "[New Trend Found] "
+                # Predict value X hours from now, but apply a modified 1/x formula the trend to not overshoot
+                # The function is applied over the "per-hour" temperature trend to result in an upper bound value of
+                # 2 degrees per-hour
+                self._predicted_temp = float(
+                    state.state) + self._predict_trend_tangential_function(_final_trend * 60) * self._predict_hours
+                message += f"Predicted temp in 1h: {self._predicted_temp}°C"
+                _LOGGER.info(message)
+            else:
+                self._predicted_temp = None  # Stop using Predicted Temperature trend until we have enough data
+                _LOGGER.warning("Failed fetching sensor history")
+        except ValueError as ex:
+            _LOGGER.error("Unable to update from sensor: %s", ex)
 
     @callback
     def _async_update_temp(self, state):
@@ -931,7 +999,7 @@ class DualSmartThermostat(ClimateEntity, RestoreEntity):
             if (
                 not self._active
                 and self._is_configured_for_heat_cool()
-                and self._cur_temp is not None
+                and self.predicted_temperature is not None
             ):
                 self._active = True
             if not self._needs_control(time, force, dual=True):
@@ -1109,14 +1177,14 @@ class DualSmartThermostat(ClimateEntity, RestoreEntity):
         """checks if active state needs to be set true"""
         if (
             not self._active
-            and None not in (self._cur_temp, self._target_temp)
+            and None not in (self.predicted_temperature, self._target_temp)
             and self._hvac_mode != HVACMode.OFF
         ):
             self._active = True
             _LOGGER.info(
                 "Obtained current and target temperature. "
                 "Dual smart thermostat active. %s, %s",
-                self._cur_temp,
+                self.predicted_temperature,
                 self._target_temp,
             )
 
@@ -1145,12 +1213,12 @@ class DualSmartThermostat(ClimateEntity, RestoreEntity):
     def _is_too_cold(self, target_attr="_target_temp") -> bool:
         """checks if the current temperature is below target"""
         target_temp = getattr(self, target_attr)
-        return target_temp >= self._cur_temp + self._cold_tolerance
+        return target_temp >= self.predicted_temperature + self._cold_tolerance
 
     def _is_too_hot(self, target_attr="_target_temp") -> bool:
         """checks if the current temperature is above target"""
         target_temp = getattr(self, target_attr)
-        return self._cur_temp >= target_temp + self._hot_tolerance
+        return self.predicted_temperature >= target_temp + self._hot_tolerance
 
     def _is_cold_or_hot(self):
         if self._is_heater_active:
