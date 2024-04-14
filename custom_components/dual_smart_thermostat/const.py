@@ -30,6 +30,7 @@ CONF_PRECISION = "precision"
 CONF_TEMP_STEP = "target_temp_step"
 CONF_OPENINGS = "openings"
 CONF_HEAT_COOL_MODE = "heat_cool_mode"
+CONF_SUMMER_MODE_SWITCH = "summer_mode_switch"
 ATTR_TIMEOUT = "timeout"
 PRESET_ANTI_FREEZE = "Anti Freeze"
 

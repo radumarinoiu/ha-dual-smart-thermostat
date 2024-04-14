@@ -83,7 +83,7 @@ from .const import (
     HVACAction,
     HVACMode,
     PRESET_ANTI_FREEZE,
-    ToleranceDevice,
+    ToleranceDevice, CONF_SUMMER_MODE_SWITCH,
 )
 from . import DOMAIN, PLATFORMS
 
@@ -117,6 +117,7 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
         vol.Optional(CONF_COOLER): cv.entity_id,
         vol.Required(CONF_SENSOR): cv.entity_id,
         vol.Optional(CONF_FLOOR_SENSOR): cv.entity_id,
+        vol.Optional(CONF_SUMMER_MODE_SWITCH): cv.entity_id,
         vol.Optional(CONF_AC_MODE): cv.boolean,
         vol.Optional(CONF_HEAT_COOL_MODE): cv.boolean,
         vol.Optional(CONF_MAX_TEMP): vol.Coerce(float),
@@ -187,6 +188,7 @@ async def async_setup_platform(
     hot_tolerance = config.get(CONF_HOT_TOLERANCE)
     keep_alive = config.get(CONF_KEEP_ALIVE)
     initial_hvac_mode = config.get(CONF_INITIAL_HVAC_MODE)
+    summer_mode_switch = config.get(CONF_SUMMER_MODE_SWITCH)
     presets_dict = {
         key: config[value] for key, value in CONF_PRESETS.items() if value in config
     }
@@ -227,6 +229,7 @@ async def async_setup_platform(
                 cooler_entity_id,
                 sensor_entity_id,
                 sensor_floor_entity_id,
+                summer_mode_switch,
                 min_temp,
                 max_temp,
                 max_floor_temp,
@@ -246,7 +249,7 @@ async def async_setup_platform(
                 target_temperature_step,
                 unit,
                 unique_id,
-                OpeningManager(hass, openings),
+                OpeningManager(hass, openings)
             )
         ]
     )
@@ -262,6 +265,7 @@ class DualSmartThermostat(ClimateEntity, RestoreEntity):
         cooler_entity_id,
         sensor_entity_id,
         sensor_floor_entity_id,
+        summer_mode_switch_entity_id,
         min_temp,
         max_temp,
         max_floor_temp,
@@ -289,6 +293,7 @@ class DualSmartThermostat(ClimateEntity, RestoreEntity):
         self.heater_entity_id = heater_entity_id
         self.cooler_entity_id = cooler_entity_id
         self.sensor_entity_id = sensor_entity_id
+        self.summer_mode_switch_entity_id = summer_mode_switch_entity_id
         self.sensor_floor_entity_id = sensor_floor_entity_id
         self.opening_manager = opening_manager
 
@@ -326,6 +331,7 @@ class DualSmartThermostat(ClimateEntity, RestoreEntity):
             self._hvac_mode = None
         self._active = False
         self._cur_temp = None
+        self._summer_mode = False
         self._predict_hours = 1
         self._predict_trend_tangential_function = lambda x: (1 - 1 / (x**2 + 1)) / 2
         self._predicted_temp = None
@@ -367,6 +373,13 @@ class DualSmartThermostat(ClimateEntity, RestoreEntity):
             )
         )
 
+        if self.summer_mode_switch_entity_id:
+            self.async_on_remove(
+                async_track_state_change_event(
+                    self.hass, [self.summer_mode_switch_entity_id], self._async_summer_mode_changed
+                )
+            )
+
         if self.cooler_entity_id:
             self.async_on_remove(
                 async_track_state_change_event(
@@ -405,6 +418,7 @@ class DualSmartThermostat(ClimateEntity, RestoreEntity):
         def _async_startup(*_):
             """Init on startup."""
             sensor_state = self.hass.states.get(self.sensor_entity_id)
+            summer_mode_state = self.hass.states.get(self.summer_mode_switch_entity_id)
             if self.sensor_floor_entity_id:
                 floor_sensor_state = self.hass.states.get(self.sensor_floor_entity_id)
             else:
@@ -415,6 +429,13 @@ class DualSmartThermostat(ClimateEntity, RestoreEntity):
                 STATE_UNKNOWN,
             ):
                 self._async_update_temp(sensor_state)
+                self.async_write_ha_state()
+
+            if summer_mode_state and summer_mode_state.state not in (
+                STATE_UNAVAILABLE,
+                STATE_UNKNOWN,
+            ):
+                self._async_update_summer_mode(summer_mode_state)
                 self.async_write_ha_state()
 
             if floor_sensor_state and floor_sensor_state.state not in (
@@ -713,6 +734,17 @@ class DualSmartThermostat(ClimateEntity, RestoreEntity):
         # Get default temp from super class
         return super().max_temp
 
+    async def _async_summer_mode_changed(self, event):
+        """Handle summer mode changes."""
+        new_state = event.data.get("new_state")
+        _LOGGER.info("Summer mode change: %s", new_state)
+        if new_state is None or new_state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+            return
+
+        self._async_update_summer_mode(new_state)
+        await self._async_control_climate()
+        self.async_write_ha_state()
+
     async def _async_sensor_changed(self, event):
         """Handle temperature changes."""
         new_state = event.data.get("new_state")
@@ -873,6 +905,15 @@ class DualSmartThermostat(ClimateEntity, RestoreEntity):
         """Update thermostat with latest state from sensor."""
         try:
             self._cur_temp = float(state.state)
+        except ValueError as ex:
+            _LOGGER.error("Unable to update from sensor: %s", ex)
+
+    @callback
+    def _async_update_summer_mode(self, state):
+        """Update thermostat with latest state from sensor."""
+        try:
+            _LOGGER.info(f"[{type(state.state)}] {state.state} == on -> {state.state == 'on'}")
+            self._summer_mode = state.state == "on"
         except ValueError as ex:
             _LOGGER.error("Unable to update from sensor: %s", ex)
 
@@ -1103,7 +1144,7 @@ class DualSmartThermostat(ClimateEntity, RestoreEntity):
 
     async def _async_heater_turn_on(self):
         """Turn heater toggleable device on."""
-        if self.heater_entity_id is not None and not self._is_heater_active:
+        if self.heater_entity_id is not None and not self._is_heater_active and not self._summer_mode:
             await self._async_switch_turn_on(self.heater_entity_id)
 
     async def _async_heater_turn_off(self):
@@ -1213,6 +1254,7 @@ class DualSmartThermostat(ClimateEntity, RestoreEntity):
     def _is_too_cold(self, target_attr="_target_temp") -> bool:
         """checks if the current temperature is below target"""
         target_temp = getattr(self, target_attr)
+
         return target_temp >= self.predicted_temperature + self._cold_tolerance
 
     def _is_too_hot(self, target_attr="_target_temp") -> bool:
