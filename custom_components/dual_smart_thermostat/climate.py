@@ -141,7 +141,7 @@ from .const import (
     DEFAULT_MAX_FLOOR_TEMP,
     DEFAULT_NAME,
     DEFAULT_TOLERANCE,
-    TIMED_OPENING_SCHEMA,
+    TIMED_OPENING_SCHEMA, CONF_FORECAST_SENSOR,
 )
 from .hvac_action_reason.hvac_action_reason import (
     SERVICE_SET_HVAC_ACTION_REASON,
@@ -214,6 +214,7 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
         vol.Required(CONF_HEATER): cv.entity_id,
         vol.Optional(CONF_COOLER): cv.entity_id,
         vol.Required(CONF_SENSOR): cv.entity_id,
+        vol.Optional(CONF_FORECAST_SENSOR): cv.entity_id,
         vol.Optional(CONF_STALE_DURATION): vol.All(
             cv.time_period, cv.positive_timedelta
         ),
@@ -282,6 +283,7 @@ async def async_setup_platform(
 
     name = config[CONF_NAME]
     sensor_entity_id = config[CONF_SENSOR]
+    sensor_forecast_entity_id = config.get(CONF_FORECAST_SENSOR)
     sensor_floor_entity_id = config.get(CONF_FLOOR_SENSOR)
     sensor_outside_entity_id = config.get(CONF_OUTSIDE_SENSOR)
     sensor_humidity_entity_id = config.get(CONF_HUMIDITY_SENSOR)
@@ -317,6 +319,7 @@ async def async_setup_platform(
             DualSmartThermostat(
                 name,
                 sensor_entity_id,
+                sensor_forecast_entity_id,
                 sensor_floor_entity_id,
                 sensor_outside_entity_id,
                 sensor_humidity_entity_id,
@@ -372,6 +375,7 @@ class DualSmartThermostat(ClimateEntity, RestoreEntity):
         self,
         name,
         sensor_entity_id,
+        sensor_forecast_entity_id,
         sensor_floor_entity_id,
         sensor_outside_entity_id,
         sensor_humidity_entity_id,
@@ -413,6 +417,7 @@ class DualSmartThermostat(ClimateEntity, RestoreEntity):
 
         # sensors
         self.sensor_entity_id = sensor_entity_id
+        self.sensor_forecast_entity_id = sensor_forecast_entity_id
         self.sensor_floor_entity_id = sensor_floor_entity_id
         self.sensor_outside_entity_id = sensor_outside_entity_id
         self.sensor_humidity_entity_id = sensor_humidity_entity_id
@@ -465,6 +470,13 @@ class DualSmartThermostat(ClimateEntity, RestoreEntity):
         self.async_on_remove(
             async_track_state_change_event(
                 self.hass, [self.sensor_entity_id], self._async_sensor_changed_event
+            )
+        )
+
+        # Add listener
+        self.async_on_remove(
+            async_track_state_change_event(
+                self.hass, [self.sensor_forecast_entity_id], self._async_forecast_sensor_changed_event
             )
         )
 
@@ -570,6 +582,10 @@ class DualSmartThermostat(ClimateEntity, RestoreEntity):
                 floor_sensor_state = self.hass.states.get(self.sensor_floor_entity_id)
             else:
                 floor_sensor_state = None
+            if self.sensor_forecast_entity_id:
+                forecast_sensor_state = self.hass.states.get(self.sensor_forecast_entity_id)
+            else:
+                forecast_sensor_state = None
 
             if sensor_state and sensor_state.state not in (
                 STATE_UNAVAILABLE,
@@ -583,6 +599,13 @@ class DualSmartThermostat(ClimateEntity, RestoreEntity):
                 STATE_UNKNOWN,
             ):
                 self.environment.update_floor_temp_from_state(floor_sensor_state)
+                self.async_write_ha_state()
+
+            if forecast_sensor_state and forecast_sensor_state.state not in (
+                STATE_UNAVAILABLE,
+                STATE_UNKNOWN,
+            ):
+                self.environment.update_forecast_temp_from_state(forecast_sensor_state)
                 self.async_write_ha_state()
 
             await self.hvac_device.async_on_startup(self.async_write_ha_state)
@@ -811,6 +834,15 @@ class DualSmartThermostat(ClimateEntity, RestoreEntity):
             self.environment.update_temp_from_state(sensor_state)
             should_contorl_climate = True
 
+        if self.sensor_forecast_entity_id:
+            sensor_forecast_state = self.hass.states.get(self.sensor_forecast_entity_id)
+            if sensor_forecast_state and sensor_forecast_state.state not in (
+                STATE_UNAVAILABLE,
+                STATE_UNKNOWN,
+            ):
+                self.environment.update_forecast_temp_from_state(sensor_forecast_state)
+                should_contorl_climate = True
+
         if self.sensor_floor_entity_id:
             sensor_floor_state = self.hass.states.get(self.sensor_floor_entity_id)
             if sensor_floor_state and sensor_floor_state.state not in (
@@ -994,6 +1026,27 @@ class DualSmartThermostat(ClimateEntity, RestoreEntity):
             )
 
         self.environment.update_temp_from_state(new_state)
+        if trigger_control:
+            await self._async_control_climate()
+        self.async_write_ha_state()
+
+    async def _async_forecast_sensor_changed_event(
+        self, event: Event[EventStateChangedData]
+    ) -> None:
+        """Handle forecast temperature changes."""
+        data = event.data
+
+        await self._async_forecast_sensor_changed(data["new_state"])
+
+    async def _async_forecast_sensor_changed(
+        self, new_state: State | None, trigger_control=True
+    ) -> None:
+        """Handle forecasted temperature changes."""
+        _LOGGER.info("Sensor forecast change: %s", new_state)
+        if new_state is None or new_state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+            return
+
+        self.environment.update_forecast_temp_from_state(new_state)
         if trigger_control:
             await self._async_control_climate()
         self.async_write_ha_state()

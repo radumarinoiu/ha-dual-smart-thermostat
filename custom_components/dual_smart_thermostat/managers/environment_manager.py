@@ -42,7 +42,7 @@ from custom_components.dual_smart_thermostat.const import (
     CONF_TARGET_TEMP_HIGH,
     CONF_TARGET_TEMP_LOW,
     CONF_TEMP_STEP,
-    DEFAULT_MAX_FLOOR_TEMP,
+    DEFAULT_MAX_FLOOR_TEMP, CONF_FORECAST_SENSOR,
 )
 from custom_components.dual_smart_thermostat.managers.state_manager import StateManager
 from custom_components.dual_smart_thermostat.preset_env.preset_env import PresetEnv
@@ -75,6 +75,7 @@ class EnvironmentManager(StateManager):
         self.hass = hass
         self._sensor_floor = config.get(CONF_FLOOR_SENSOR)
         self._sensor = config.get(CONF_SENSOR)
+        self._forecast_sensor = config.get(CONF_FORECAST_SENSOR)
         self._outside_sensor = config.get(CONF_OUTSIDE_SENSOR)
         self._sensor_stale_duration: timedelta | None = config.get(CONF_STALE_DURATION)
 
@@ -107,6 +108,7 @@ class EnvironmentManager(StateManager):
         self._temperature_unit = hass.config.units.temperature_unit
 
         self._cur_temp = None
+        self._forecast_temp = None
         self._cur_floor_temp = None
         self._cur_outside_temp = None
         self._cur_humidity = None
@@ -347,17 +349,18 @@ class EnvironmentManager(StateManager):
     def is_too_cold(self, target_attr="_target_temp") -> bool:
         """Checks if the current temperature is below target."""
         target_temp = getattr(self, target_attr)
-        if self._cur_temp is None or target_temp is None:
+        if (self._forecast_temp is None and self._cur_temp is None) or target_temp is None:
             return False
 
         _LOGGER.debug(
-            "is_too_cold - target temp attr: %s, Target temp: %s, current temp: %s, tolerance: %s",
+            "is_too_cold - target temp attr: %s, Target temp: %s, current temp: %s, forecasted temp: %s, tolerance: %s",
             target_attr,
             target_temp,
             self._cur_temp,
+            self._forecast_temp,
             self._cold_tolerance,
         )
-        return target_temp >= self._cur_temp + self._cold_tolerance
+        return target_temp >= (self._forecast_temp or self._cur_temp) + self._cold_tolerance
 
     def is_too_hot(self, target_attr="_target_temp") -> bool:
         """Checks if the current temperature is above target."""
@@ -372,7 +375,7 @@ class EnvironmentManager(StateManager):
             self._cur_temp,
             self._hot_tolerance,
         )
-        return self._cur_temp >= target_temp + self._hot_tolerance
+        return (self._forecast_temp or self._cur_temp) >= target_temp + self._hot_tolerance
 
     @property
     def is_too_moist(self) -> bool:
@@ -431,7 +434,7 @@ class EnvironmentManager(StateManager):
 
     @callback
     def update_floor_temp_from_state(self, state: State):
-        """Update ermostat with latest floor temp state from floor temp sensor."""
+        """Update thermostat with latest floor temp state from floor temp sensor."""
         try:
             cur_floor_temp = float(state.state)
             if not math.isfinite(cur_floor_temp):
@@ -439,6 +442,17 @@ class EnvironmentManager(StateManager):
             self._cur_floor_temp = cur_floor_temp
         except ValueError as ex:
             _LOGGER.error("Unable to update from floor temp sensor: %s", ex)
+
+    @callback
+    def update_forecast_temp_from_state(self, state: State):
+        """Update thermostat with latest floor temp state from floor temp sensor."""
+        try:
+            cur_forecast_temp = float(state.state)
+            if not math.isfinite(cur_forecast_temp):
+                raise ValueError(f"Sensor has illegal state {state.state}")
+            self._forecast_temp = cur_forecast_temp
+        except ValueError as ex:
+            _LOGGER.error("Unable to update from forecast temp sensor: %s", ex)
 
     @callback
     def update_outside_temp_from_state(self, state: State):
